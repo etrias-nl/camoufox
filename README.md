@@ -1,0 +1,2 @@
+# camoufox
+Internal Camoufox image
