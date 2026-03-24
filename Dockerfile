@@ -3,7 +3,7 @@ FROM python:3.12.13-slim
 WORKDIR /app
 
 # renovate: datasource=github-tags depName=pip packageName=pypa/pip
-ENV PIP_VERSION=25.3
+ENV PIP_VERSION=26.0.1
 RUN python -m pip install --root-user-action ignore --upgrade pip==${PIP_VERSION}
 
 COPY requirements.txt .
