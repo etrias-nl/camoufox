@@ -7,13 +7,15 @@ ENV PIP_VERSION=25.3
 RUN python -m pip install --root-user-action ignore --upgrade pip==${PIP_VERSION}
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
 
 RUN python -m camoufox fetch
 
 # Install browser dependencies manually (playwright install-deps doesn't support Debian Trixie)
 # Also includes Xvfb + x11vnc + noVNC for live debug viewing (activated by DEBUG=1)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update && apt-get install -y --no-install-recommends \
     libasound2t64 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
