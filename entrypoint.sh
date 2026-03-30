@@ -5,7 +5,7 @@ if [ "${CAMOUFOX_DEBUG:-0}" = "1" ]; then
     echo "DEBUG mode: starting Xvfb + x11vnc + noVNC on port 6080"
 
     # Start virtual framebuffer
-    Xvfb :99 -screen 0 1280x1100x24 -ac &
+    Xvfb :99 -screen 0 1920x1080x24 -ac &
     sleep 1
     export DISPLAY=:99
 
