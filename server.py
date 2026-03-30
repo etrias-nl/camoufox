@@ -37,7 +37,7 @@ sessions: dict[str, dict[str, Any]] = {}
 # Configuration
 # ---------------------------------------------------------------------------
 PROXY_URL = os.getenv("TWO_CAPTCHA_PROXY_URL", "")
-DEBUG_MODE = os.getenv("DEBUG", "0") == "1"
+DEBUG_MODE = os.getenv("CAMOUFOX_DEBUG", "0") == "1"
 
 
 # ---------------------------------------------------------------------------
