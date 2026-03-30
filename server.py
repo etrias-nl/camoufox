@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from camoufox.async_api import AsyncCamoufox
+from camoufox.exceptions import InvalidIP
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -167,8 +168,14 @@ async def create_session(req: CreateSessionRequest):
         camoufox_kwargs["proxy"] = proxy_config
         camoufox_kwargs["geoip"] = True
 
-    browser_cm = AsyncCamoufox(**camoufox_kwargs)
-    browser = await browser_cm.__aenter__()
+    try:
+        browser_cm = AsyncCamoufox(**camoufox_kwargs)
+        browser = await browser_cm.__aenter__()
+    except InvalidIP:
+        logger.warning(f"Session {session_id} geoip lookup failed, retrying without geoip")
+        camoufox_kwargs["geoip"] = False
+        browser_cm = AsyncCamoufox(**camoufox_kwargs)
+        browser = await browser_cm.__aenter__()
     page = await browser.new_page()
     await page.set_viewport_size(
         {"width": req.viewport_width, "height": req.viewport_height}
