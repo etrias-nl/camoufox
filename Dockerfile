@@ -13,7 +13,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN python -m camoufox fetch
 
 # Install browser dependencies manually (playwright install-deps doesn't support Debian Trixie)
-# Also includes Xvfb + x11vnc + noVNC for live debug viewing (activated by DEBUG=1)
+# Also includes Xvfb + x11vnc + noVNC for live debug viewing (activated by CAMOUFOX_DEBUG=1)
 RUN --mount=type=cache,target=/var/cache/apt \
     apt-get update && apt-get install -y --no-install-recommends \
     libasound2t64 \
