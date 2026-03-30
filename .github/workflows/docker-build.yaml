@@ -48,6 +48,7 @@ jobs:
                     set -eux
                     docker run --rm --entrypoint= '${{ steps.build.outputs.imageid }}' pip --version
                     docker run --rm --entrypoint= '${{ steps.build.outputs.imageid }}' camoufox version
+                    docker run --rm --entrypoint= '${{ steps.build.outputs.imageid }}' python -c "import server"
             -
                 uses: docker/login-action@v4.0.0
                 with:
