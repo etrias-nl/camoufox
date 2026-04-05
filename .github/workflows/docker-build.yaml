@@ -50,7 +50,7 @@ jobs:
                     docker run --rm --entrypoint= '${{ steps.build.outputs.imageid }}' camoufox version
                     docker run --rm --entrypoint= '${{ steps.build.outputs.imageid }}' python -c "import server"
             -
-                uses: docker/login-action@v4.0.0
+                uses: docker/login-action@v4.1.0
                 with:
                     username: ${{ secrets.DOCKER_HUB_USERNAME }}
                     password: ${{ secrets.DOCKER_HUB_PASSWORD }}
@@ -89,7 +89,7 @@ jobs:
                 with:
                     keep-state: true
             -
-                uses: docker/login-action@v4.0.0
+                uses: docker/login-action@v4.1.0
                 with:
                     username: ${{ secrets.DOCKER_HUB_USERNAME }}
                     password: ${{ secrets.DOCKER_HUB_PASSWORD }}
