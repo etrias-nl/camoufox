@@ -89,12 +89,21 @@ async def human_delay(mean: float = 2.0, std: float = 1.0):
 
 
 async def simulate_page_arrival(page, behavior: str):
-    """Brief pause after page load — Camoufox handles the rest."""
+    """Simulate a user settling onto a freshly loaded page: small glance
+    with the mouse and a short scroll. Camoufox's humanize=True already
+    curves the mouse path between points."""
     if behavior == "fast":
         await asyncio.sleep(random.uniform(0.3, 0.8))
         return
 
     await human_delay(1.0, 0.5)
+
+    viewport = page.viewport_size or {"width": 1200, "height": 1100}
+    max_x = max(101, viewport["width"] - 100)
+    max_y = max(101, viewport["height"] - 100)
+    for _ in range(random.randint(1, 3)):
+        await page.mouse.move(random.randint(100, max_x), random.randint(100, max_y))
+        await asyncio.sleep(random.uniform(0.2, 0.7))
 
     # 70% chance: scroll a bit to look natural
     if random.random() < 0.7:
@@ -179,6 +188,7 @@ async def create_session(req: CreateSessionRequest):
         "browser": browser_cm,
         "page": page,
         "behavior": req.behavior,
+        "first_navigation": True,
     }
 
     logger.info(f"Session {session_id} created (behavior={req.behavior})")
@@ -197,8 +207,15 @@ async def navigate(session_id: str, req: NavigateRequest):
     page = session["page"]
     behavior = session["behavior"]
 
+    goto_kwargs: dict[str, Any] = {"wait_until": "domcontentloaded", "timeout": 60000}
+    if session["first_navigation"]:
+        # Fresh session has no referrer chain; arrive as if from a Google
+        # search so the target doesn't see a direct-load / no-referrer hit.
+        goto_kwargs["referer"] = "https://www.google.com/"
+        session["first_navigation"] = False
+
     logger.info(f"Session {session_id}: navigating to {req.url}")
-    await page.goto(req.url, wait_until="domcontentloaded", timeout=60000)
+    await page.goto(req.url, **goto_kwargs)
 
     await simulate_page_arrival(page, behavior)
 
@@ -290,6 +307,13 @@ async def scroll(session_id: str):
     page = session["page"]
     await page.evaluate("window.scrollBy(0, window.innerHeight * 0.6)")
     return {"scrolled": True}
+
+
+@app.post("/session/{session_id}/page_arrived")
+async def page_arrived(session_id: str):
+    session = get_session(session_id)
+    await simulate_page_arrival(session["page"], session["behavior"])
+    return {"arrived": True}
 
 
 @app.get("/session/{session_id}/ip")
