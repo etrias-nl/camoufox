@@ -52,6 +52,7 @@ class CreateSessionRequest(BaseModel):
 
 class NavigateRequest(BaseModel):
     url: str
+    page_arrival: bool = True
 
 
 class ScriptRequest(BaseModel):
@@ -217,7 +218,8 @@ async def navigate(session_id: str, req: NavigateRequest):
     logger.info(f"Session {session_id}: navigating to {req.url}")
     await page.goto(req.url, **goto_kwargs)
 
-    await simulate_page_arrival(page, behavior)
+    if req.page_arrival:
+        await simulate_page_arrival(page, behavior)
 
     html = await page.content()
     return {"html": html, "url": page.url}
