@@ -52,7 +52,6 @@ class CreateSessionRequest(BaseModel):
 
 class NavigateRequest(BaseModel):
     url: str
-    warm_up: bool = True
 
 
 class ScriptRequest(BaseModel):
@@ -101,11 +100,6 @@ async def simulate_page_arrival(page, behavior: str):
     if random.random() < 0.7:
         await page.evaluate(f"window.scrollBy(0, {random.randint(100, 300)})")
         await human_delay(0.8, 0.4)
-
-
-def extract_base_url(url: str) -> str:
-    parsed = urlparse(url)
-    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +179,6 @@ async def create_session(req: CreateSessionRequest):
         "browser": browser_cm,
         "page": page,
         "behavior": req.behavior,
-        "visited_homepage": False,
     }
 
     logger.info(f"Session {session_id} created (behavior={req.behavior})")
@@ -203,17 +196,6 @@ async def navigate(session_id: str, req: NavigateRequest):
     session = get_session(session_id)
     page = session["page"]
     behavior = session["behavior"]
-
-    # Homepage warmup
-    base_url = extract_base_url(req.url)
-    if req.warm_up and not session["visited_homepage"]:
-        if base_url != req.url:
-            logger.info(f"Session {session_id}: warming up at {base_url}")
-            await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
-            await human_delay(1.5, 0.5)
-            session["visited_homepage"] = True
-        else:
-            session["visited_homepage"] = True
 
     logger.info(f"Session {session_id}: navigating to {req.url}")
     await page.goto(req.url, wait_until="domcontentloaded", timeout=60000)
