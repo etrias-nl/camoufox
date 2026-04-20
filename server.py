@@ -192,7 +192,11 @@ async def google_search_warmup(
                 f"Session {session_id}: warmup:google_load_timeout ({exc})"
             )
 
-        await simulate_page_arrival(page, session["behavior"])
+        # Google doesn't fingerprint mouse trajectories or per-character
+        # typing cadence the way the portal anti-bot does — its defenses
+        # are IP/TLS/UA-based, which residential proxy + Camoufox already
+        # cover. Skip the humanize ritual here to shave seconds off every
+        # session startup.
 
         # Consent interstitial (Dutch "Alles accepteren"). Short wait —
         # NL residential IPs usually skip it entirely.
@@ -201,18 +205,13 @@ async def google_search_warmup(
             await consent.wait_for(state="visible", timeout=3000)
             await consent.click()
             logger.info(f"Session {session_id}: warmup:consent_clicked")
-            await human_delay(0.6, 0.3)
         except Exception:
             pass
 
         search_box = page.locator('textarea[name="q"], input[name="q"]').first
         await search_box.wait_for(state="visible", timeout=8000)
-        await search_box.scroll_into_view_if_needed()
         await search_box.click()
-
-        # Hands-to-keyboard pause, same as /type
-        await asyncio.sleep(random.uniform(0.4, 0.9))
-        await _humanized_type_text(page, session["behavior"], query)
+        await search_box.fill(query)
         await page.keyboard.press("Enter")
         logger.info(f"Session {session_id}: warmup:query_submitted")
 
@@ -222,7 +221,6 @@ async def google_search_warmup(
             logger.warning(
                 f"Session {session_id}: warmup:serp_load_timeout ({exc})"
             )
-        await human_delay(0.8, 0.4)
         logger.info(
             f"Session {session_id}: warmup:serp_loaded url={page.url!r}"
         )
