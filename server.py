@@ -403,14 +403,26 @@ async def navigate(session_id: str, req: NavigateRequest):
     if session["first_navigation"]:
         target_host = (urlparse(req.url).hostname or "").lower()
         already_google = target_host.endswith("google.com") or target_host.endswith("google.nl")
-        warmup_ok = False
-        if session["google_warmup"] and not already_google:
-            warmup_ok = await google_search_warmup(session, req.url, session_id)
-        if not warmup_ok:
-            # No real search history — fall back to the cheap fake
-            # referrer so the target doesn't see a bare direct load.
-            goto_kwargs["referer"] = "https://www.google.com/"
-        session["first_navigation"] = False
+        if already_google:
+            # Caller is pre-navigating to google themselves (intentionally
+            # or not). Don't consume first_navigation — let the warmup run
+            # when they eventually navigate to a non-google URL. This
+            # call becomes a bare goto with whatever Referer logic below
+            # derives from page.url, which is about:blank on a cold
+            # session so we send no Referer (matches a URL-bar visit).
+            logger.info(
+                f"Session {session_id}: deferring first_navigation warmup — "
+                f"target is google ({target_host})"
+            )
+        else:
+            warmup_ok = False
+            if session["google_warmup"]:
+                warmup_ok = await google_search_warmup(session, req.url, session_id)
+            if not warmup_ok:
+                # No real search history — fall back to the cheap fake
+                # referrer so the target doesn't see a bare direct load.
+                goto_kwargs["referer"] = "https://www.google.com/"
+            session["first_navigation"] = False
 
     # Playwright's page.goto does NOT auto-inherit the current page's URL
     # as Referer — it's address-bar-equivalent. Set it explicitly so the
