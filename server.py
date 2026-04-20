@@ -135,58 +135,6 @@ def _hostname_sld(url: str) -> str:
     return labels[0]
 
 
-async def _human_scroll_by(page, delta_y: int) -> None:
-    """Scroll the page by delta_y pixels using real mouse wheel events in
-    several small chunks with small random delays. Fires wheel/scroll
-    handlers the same way a real trackpad or wheel would, instead of the
-    instant window.scrollBy jump."""
-    if delta_y == 0:
-        return
-    direction = 1 if delta_y > 0 else -1
-    remaining = abs(delta_y)
-    while remaining > 0:
-        step = min(remaining, random.randint(60, 140))
-        await page.mouse.wheel(0, step * direction)
-        remaining -= step
-        if remaining > 0:
-            await asyncio.sleep(random.uniform(0.04, 0.12))
-
-
-async def _human_scroll_to_locator(page, locator, target_ratio: float = 0.4) -> None:
-    """Scroll via mouse wheel until the locator sits near target_ratio of
-    the viewport height (0.0=top, 0.5=center, 1.0=bottom). No-op if
-    already in view. Falls back to Playwright's scroll_into_view_if_needed
-    if wheel scrolling stalls (e.g. element inside a nested scroll
-    container where page.mouse.wheel wouldn't help)."""
-    prev_y: float | None = None
-    for _ in range(15):
-        try:
-            box = await locator.bounding_box()
-        except Exception:
-            break
-        if not box:
-            break
-        viewport = page.viewport_size or {"width": 1200, "height": 900}
-        vh = viewport["height"]
-        elem_center = box["y"] + box["height"] / 2
-        target_y = vh * target_ratio
-        delta = elem_center - target_y
-        if abs(delta) < 40:
-            return
-        if prev_y is not None and abs(box["y"] - prev_y) < 1:
-            break  # stuck — nested scroll container or page boundary
-        prev_y = box["y"]
-        step = int(max(-280, min(280, delta)))
-        await page.mouse.wheel(0, step)
-        await asyncio.sleep(random.uniform(0.05, 0.14))
-
-    # Fallback for nested scroll containers or edge cases.
-    try:
-        await locator.scroll_into_view_if_needed()
-    except Exception:
-        pass
-
-
 async def simulate_page_arrival(page, behavior: str):
     """Simulate a user settling onto a freshly loaded page: small glance
     with the mouse and a short scroll. Camoufox's humanize=True already
@@ -207,7 +155,7 @@ async def simulate_page_arrival(page, behavior: str):
 
     # 70% chance: scroll a bit to look natural
     if random.random() < 0.7:
-        await _human_scroll_by(page, random.randint(100, 300))
+        await page.evaluate(f"window.scrollBy(0, {random.randint(100, 300)})")
         await human_delay(0.8, 0.4)
 
 
@@ -550,7 +498,7 @@ async def click(session_id: str, req: ClickRequest):
     page = session["page"]
     await _wait_for_load_best_effort(page, session_id, "click")
     locator = page.locator(req.selector)
-    await _human_scroll_to_locator(page, locator)
+    await locator.scroll_into_view_if_needed()
     await locator.click()
     return {"clicked": True}
 
@@ -562,7 +510,7 @@ async def type_text(session_id: str, req: TypeRequest):
     behavior = session["behavior"]
     await _wait_for_load_best_effort(page, session_id, "type")
     locator = page.locator(req.selector)
-    await _human_scroll_to_locator(page, locator)
+    await locator.scroll_into_view_if_needed()
     await locator.click()
 
     # Simulate hands moving from mouse back to keyboard
@@ -583,8 +531,7 @@ async def press_key(session_id: str, req: KeyRequest):
 async def scroll(session_id: str):
     session = get_session(session_id)
     page = session["page"]
-    viewport = page.viewport_size or {"width": 1200, "height": 900}
-    await _human_scroll_by(page, int(viewport["height"] * 0.6))
+    await page.evaluate("window.scrollBy(0, window.innerHeight * 0.6)")
     return {"scrolled": True}
 
 
