@@ -102,6 +102,43 @@ async def human_delay(mean: float = 2.0, std: float = 1.0):
     await asyncio.sleep(delay)
 
 
+async def _humanized_type_text(page, behavior: str, text: str) -> None:
+    """Per-character typing cadence. Used by /type and the Google warmup
+    so both look identical on the wire."""
+    for char in text:
+        await page.keyboard.press(char)
+        if behavior == "fast":
+            await asyncio.sleep(random.uniform(0.01, 0.05))
+        else:
+            await asyncio.sleep(random.uniform(0.05, 0.20))
+            # 3% chance of longer pause (as if thinking)
+            if random.random() < 0.03:
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+
+
+# Two-part public suffixes we hit in practice. tldextract would be
+# comprehensive but we don't need the extra dep for portal hostnames.
+_TWO_PART_TLDS = frozenset({
+    "co.uk", "co.nz", "com.au", "co.jp", "co.za", "com.br",
+    "com.mx", "com.sg", "com.hk", "com.tr",
+})
+
+
+def _hostname_sld(url: str) -> str:
+    """Extract the second-level label of a URL's hostname, e.g.
+    https://partners.timberland.com/x -> 'timberland',
+    https://foo.co.uk/ -> 'foo'. Falls back to 'site' if no hostname."""
+    host = (urlparse(url).hostname or "").lower()
+    if not host:
+        return "site"
+    labels = host.split(".")
+    if len(labels) >= 3 and ".".join(labels[-2:]) in _TWO_PART_TLDS:
+        return labels[-3]
+    if len(labels) >= 2:
+        return labels[-2]
+    return labels[0]
+
+
 def _clamp(value: float, low: float, high: float) -> int:
     return int(max(low, min(high, value)))
 
@@ -169,6 +206,83 @@ async def simulate_page_arrival(session: dict[str, Any]):
     if random.random() < 0.7:
         await page.evaluate(f"window.scrollBy(0, {random.randint(100, 300)})")
         await human_delay(0.8, 0.4)
+
+
+async def google_search_warmup(
+    session: dict[str, Any],
+    target_url: str,
+    session_id: str,
+) -> bool:
+    """Build a real search history on google.nl before the first target
+    navigation. Goto google.nl, (optionally) clear the consent
+    interstitial, type a derived query, submit, and leave the browser
+    on the SERP — the subsequent page.goto(target_url) then sets Referer
+    from the SERP URL naturally, and the session has real Google cookies
+    / TLS history.
+
+    We deliberately do not click a SERP anchor: brand queries often
+    surface the wrong page and the anchor selector is fragile. The
+    caller's next navigate does the real load.
+
+    Returns True if we reached the SERP, False otherwise."""
+    page = session["page"]
+    query = session["google_query"] or f"{_hostname_sld(target_url)} portal"
+    logger.info(f"Session {session_id}: warmup:start query={query!r}")
+
+    try:
+        try:
+            await page.goto(
+                "https://www.google.nl/",
+                wait_until="load",
+                timeout=30000,
+            )
+        except PlaywrightTimeoutError as exc:
+            logger.warning(
+                f"Session {session_id}: warmup:google_load_timeout ({exc})"
+            )
+
+        await simulate_page_arrival(session)
+
+        # Consent interstitial (Dutch "Alles accepteren"). Short wait —
+        # NL residential IPs usually skip it entirely.
+        try:
+            consent = page.locator("#L2AGLb")
+            await consent.wait_for(state="visible", timeout=3000)
+            await consent.click()
+            await _update_last_mouse_from_locator(session, consent)
+            logger.info(f"Session {session_id}: warmup:consent_clicked")
+            await human_delay(0.6, 0.3)
+        except Exception:
+            pass
+
+        search_box = page.locator('textarea[name="q"], input[name="q"]').first
+        await search_box.wait_for(state="visible", timeout=8000)
+        await search_box.scroll_into_view_if_needed()
+        await search_box.click()
+        await _update_last_mouse_from_locator(session, search_box)
+
+        # Hands-to-keyboard pause, same as /type
+        await asyncio.sleep(random.uniform(0.4, 0.9))
+        await _humanized_type_text(page, session["behavior"], query)
+        await page.keyboard.press("Enter")
+        logger.info(f"Session {session_id}: warmup:query_submitted")
+
+        try:
+            await page.wait_for_load_state("load", timeout=30000)
+        except PlaywrightTimeoutError as exc:
+            logger.warning(
+                f"Session {session_id}: warmup:serp_load_timeout ({exc})"
+            )
+        await human_delay(0.8, 0.4)
+        logger.info(
+            f"Session {session_id}: warmup:serp_loaded url={page.url!r}"
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            f"Session {session_id}: warmup:fallthrough reason={exc!r}"
+        )
+        return False
 
 
 async def _wait_for_load_best_effort(page, session_id: str, action: str) -> None:
@@ -356,11 +470,20 @@ async def navigate(session_id: str, req: NavigateRequest):
 
     goto_kwargs: dict[str, Any] = {"wait_until": "load", "timeout": 60000}
     if session["first_navigation"]:
-        # Fresh session has no referrer chain; arrive as if from a Google
-        # search so the target doesn't see a direct-load / no-referrer hit.
-        # Phase 4 replaces this with a real google.nl warmup.
-        goto_kwargs["referer"] = "https://www.google.com/"
+        target_host = (urlparse(req.url).hostname or "").lower()
+        already_google = target_host.endswith("google.com") or target_host.endswith("google.nl")
+        warmup_ok = False
+        if session["google_warmup"] and not already_google:
+            warmup_ok = await google_search_warmup(session, req.url, session_id)
+        if not warmup_ok:
+            # No real search history — fall back to the cheap fake
+            # referrer so the target doesn't see a bare direct load.
+            goto_kwargs["referer"] = "https://www.google.com/"
         session["first_navigation"] = False
+        logger.info(
+            f"Session {session_id}: first_navigation warmup_ok={warmup_ok} "
+            f"referer={goto_kwargs.get('referer') or f'<in-session: {page.url!r}>'}"
+        )
 
     logger.info(f"Session {session_id}: navigating to {req.url}")
     try:
@@ -442,16 +565,7 @@ async def type_text(session_id: str, req: TypeRequest):
 
     # Simulate hands moving from mouse back to keyboard
     await asyncio.sleep(random.uniform(0.4, 0.9))
-
-    for char in req.text:
-        await page.keyboard.press(char)
-        if behavior == "fast":
-            await asyncio.sleep(random.uniform(0.01, 0.05))
-        else:
-            await asyncio.sleep(random.uniform(0.05, 0.20))
-            # 3% chance of longer pause (as if thinking)
-            if random.random() < 0.03:
-                await asyncio.sleep(random.uniform(0.3, 0.8))
+    await _humanized_type_text(page, behavior, req.text)
     return {"typed": True}
 
 
