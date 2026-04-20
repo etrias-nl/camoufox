@@ -13,9 +13,7 @@ import os
 import random
 import re
 import string
-import time
 import uuid
-from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urlparse
@@ -46,8 +44,6 @@ DEBUG_MODE = os.getenv("CAMOUFOX_DEBUG", "0") == "1"
 # and uses the first entry as the primary navigator.language; the Accept-
 # Language header is generated downstream from the full list.
 DEFAULT_LOCALE = "nl-NL, nl, en"
-DEBUG_EVENT_CAP = 500
-_SENSITIVE_HEADERS = {"authorization", "proxy-authorization", "cookie", "set-cookie"}
 
 
 # ---------------------------------------------------------------------------
@@ -139,40 +135,11 @@ def _hostname_sld(url: str) -> str:
     return labels[0]
 
 
-def _clamp(value: float, low: float, high: float) -> int:
-    return int(max(low, min(high, value)))
-
-
-async def _move_and_track(page, session: dict[str, Any], x: int, y: int) -> None:
-    await page.mouse.move(x, y)
-    session["last_mouse"] = (x, y)
-
-
-async def _update_last_mouse_from_locator(session: dict[str, Any], locator) -> None:
-    """Set session last_mouse to the on-screen center of a locator. No-op if
-    the element is gone (navigated away, detached) or offscreen."""
-    try:
-        box = await locator.bounding_box()
-    except Exception:
-        return
-    if not box:
-        return
-    session["last_mouse"] = (
-        int(box["x"] + box["width"] / 2),
-        int(box["y"] + box["height"] / 2),
-    )
-
-
-async def simulate_page_arrival(session: dict[str, Any]):
+async def simulate_page_arrival(page, behavior: str):
     """Simulate a user settling onto a freshly loaded page: small glance
-    with the mouse and a short scroll. Continues from the last known
-    cursor position so the pointer doesn't teleport across navigations —
-    a real OS cursor stays where the user left it.
-
-    Camoufox's humanize=True curves the mouse path between points; we
-    pick the points."""
-    page = session["page"]
-    behavior = session["behavior"]
+    with the mouse and a short scroll. Camoufox's humanize=True already
+    curves the mouse path from the current cursor position to each
+    destination, so we just pick the destinations."""
     if behavior == "fast":
         await asyncio.sleep(random.uniform(0.3, 0.8))
         return
@@ -180,26 +147,10 @@ async def simulate_page_arrival(session: dict[str, Any]):
     await human_delay(1.0, 0.5)
 
     viewport = page.viewport_size or {"width": 1200, "height": 1100}
-    margin = 20
-    max_x = viewport["width"] - margin
-    max_y = viewport["height"] - margin
-    sx, sy = session["last_mouse"]
-
-    # First move: short drift from wherever the cursor already is, so the
-    # new-page settle looks continuous with whatever the user was doing
-    # before. ~150px gaussian, clamped inside the viewport.
-    nearby_x = _clamp(sx + random.gauss(0, 150), margin, max_x)
-    nearby_y = _clamp(sy + random.gauss(0, 150), margin, max_y)
-    await _move_and_track(page, session, nearby_x, nearby_y)
-    await asyncio.sleep(random.uniform(0.2, 0.7))
-
-    # Then 1-3 more "glance around" moves. These can be broader but we
-    # still anchor them to the current cursor rather than a fresh random.
+    max_x = max(101, viewport["width"] - 100)
+    max_y = max(101, viewport["height"] - 100)
     for _ in range(random.randint(1, 3)):
-        cx, cy = session["last_mouse"]
-        gx = _clamp(cx + random.gauss(0, 220), margin, max_x)
-        gy = _clamp(cy + random.gauss(0, 220), margin, max_y)
-        await _move_and_track(page, session, gx, gy)
+        await page.mouse.move(random.randint(100, max_x), random.randint(100, max_y))
         await asyncio.sleep(random.uniform(0.2, 0.7))
 
     # 70% chance: scroll a bit to look natural
@@ -241,7 +192,7 @@ async def google_search_warmup(
                 f"Session {session_id}: warmup:google_load_timeout ({exc})"
             )
 
-        await simulate_page_arrival(session)
+        await simulate_page_arrival(page, session["behavior"])
 
         # Consent interstitial (Dutch "Alles accepteren"). Short wait —
         # NL residential IPs usually skip it entirely.
@@ -249,7 +200,6 @@ async def google_search_warmup(
             consent = page.locator("#L2AGLb")
             await consent.wait_for(state="visible", timeout=3000)
             await consent.click()
-            await _update_last_mouse_from_locator(session, consent)
             logger.info(f"Session {session_id}: warmup:consent_clicked")
             await human_delay(0.6, 0.3)
         except Exception:
@@ -259,7 +209,6 @@ async def google_search_warmup(
         await search_box.wait_for(state="visible", timeout=8000)
         await search_box.scroll_into_view_if_needed()
         await search_box.click()
-        await _update_last_mouse_from_locator(session, search_box)
 
         # Hands-to-keyboard pause, same as /type
         await asyncio.sleep(random.uniform(0.4, 0.9))
@@ -277,6 +226,7 @@ async def google_search_warmup(
         logger.info(
             f"Session {session_id}: warmup:serp_loaded url={page.url!r}"
         )
+        await _log_state_snapshot(page, session_id, "post_warmup")
         return True
     except Exception as exc:
         logger.warning(
@@ -301,52 +251,45 @@ async def _wait_for_load_best_effort(page, session_id: str, action: str) -> None
 
 
 # ---------------------------------------------------------------------------
-# Debug instrumentation
+# Debug logging
 # ---------------------------------------------------------------------------
+# When CAMOUFOX_DEBUG=1, log a one-line state snapshot after key events
+# (post-warmup, post-first-navigate) so we can verify locale, referrer,
+# cookies, etc. from `docker compose logs` without new HTTP endpoints.
 
-def _safe_headers(headers: dict[str, str]) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for k, v in headers.items():
-        if k.lower() in _SENSITIVE_HEADERS:
-            out[k] = f"<redacted, {len(v)} chars>"
-        else:
-            out[k] = v[:512]
-    return out
-
-
-def _attach_debug_listeners(page, events: deque) -> None:
-    def on_request(request):
-        try:
-            events.append({
-                "ts": time.time(),
-                "type": "request",
-                "method": request.method,
-                "url": request.url,
-                "resource_type": request.resource_type,
-                "headers": _safe_headers(request.headers),
-            })
-        except Exception as exc:  # never let listener errors kill the page
-            logger.debug(f"debug request listener failed: {exc}")
-
-    def on_response(response):
-        try:
-            events.append({
-                "ts": time.time(),
-                "type": "response",
-                "status": response.status,
-                "url": response.url,
-                "headers": _safe_headers(response.headers),
-            })
-        except Exception as exc:
-            logger.debug(f"debug response listener failed: {exc}")
-
-    page.on("request", on_request)
-    page.on("response", on_response)
-
-
-def _ensure_debug_enabled() -> None:
+async def _log_state_snapshot(page, session_id: str, label: str) -> None:
     if not DEBUG_MODE:
-        raise HTTPException(status_code=404, detail="Debug mode not enabled")
+        return
+    try:
+        state = await page.evaluate(
+            """() => ({
+                url: document.URL,
+                referrer: document.referrer,
+                language: navigator.language,
+                languages: Array.from(navigator.languages || []),
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            })"""
+        )
+    except Exception as exc:
+        logger.info(f"Session {session_id}: {label} state_snapshot_failed ({exc})")
+        return
+
+    try:
+        cookies = await page.context.cookies()
+        domain_counts: dict[str, int] = {}
+        for c in cookies:
+            domain_counts[c.get("domain") or "?"] = (
+                domain_counts.get(c.get("domain") or "?", 0) + 1
+            )
+    except Exception:
+        domain_counts = {}
+
+    logger.info(
+        f"Session {session_id}: {label} url={state['url']!r} "
+        f"referrer={state['referrer']!r} lang={state['language']!r} "
+        f"langs={state['languages']} tz={state['timezone']!r} "
+        f"cookies={domain_counts}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +371,7 @@ async def create_session(req: CreateSessionRequest):
         {"width": req.viewport_width, "height": req.viewport_height}
     )
 
-    session = {
+    sessions[session_id] = {
         "browser": browser_cm,
         "page": page,
         "behavior": req.behavior,
@@ -436,19 +379,7 @@ async def create_session(req: CreateSessionRequest):
         "locale": locale,
         "google_warmup": req.google_warmup,
         "google_query": req.google_query,
-        # Initial cursor position — used by Phase 2 (cursor continuity).
-        # Keeping it populated now so the debug snapshot is consistent.
-        "last_mouse": (
-            random.randint(100, max(101, req.viewport_width - 100)),
-            random.randint(50, max(51, req.viewport_height // 3)),
-        ),
-        "debug_events": deque(maxlen=DEBUG_EVENT_CAP) if DEBUG_MODE else None,
     }
-
-    if DEBUG_MODE:
-        _attach_debug_listeners(page, session["debug_events"])
-
-    sessions[session_id] = session
 
     logger.info(
         f"Session {session_id} created (behavior={req.behavior}, locale={locale}, "
@@ -498,7 +429,9 @@ async def navigate(session_id: str, req: NavigateRequest):
         )
 
     if req.page_arrival:
-        await simulate_page_arrival(session)
+        await simulate_page_arrival(page, session["behavior"])
+
+    await _log_state_snapshot(page, session_id, "post_navigate")
 
     html = await page.content()
     return {"html": html, "url": page.url}
@@ -548,7 +481,6 @@ async def click(session_id: str, req: ClickRequest):
     locator = page.locator(req.selector)
     await locator.scroll_into_view_if_needed()
     await locator.click()
-    await _update_last_mouse_from_locator(session, locator)
     return {"clicked": True}
 
 
@@ -561,7 +493,6 @@ async def type_text(session_id: str, req: TypeRequest):
     locator = page.locator(req.selector)
     await locator.scroll_into_view_if_needed()
     await locator.click()
-    await _update_last_mouse_from_locator(session, locator)
 
     # Simulate hands moving from mouse back to keyboard
     await asyncio.sleep(random.uniform(0.4, 0.9))
@@ -588,7 +519,7 @@ async def scroll(session_id: str):
 @app.post("/session/{session_id}/page_arrived")
 async def page_arrived(session_id: str):
     session = get_session(session_id)
-    await simulate_page_arrival(session)
+    await simulate_page_arrival(session["page"], session["behavior"])
     return {"arrived": True}
 
 
@@ -610,110 +541,6 @@ async def screenshot(session_id: str):
     session = get_session(session_id)
     screenshot_bytes = await session["page"].screenshot()
     return {"base64": base64.b64encode(screenshot_bytes).decode()}
-
-
-@app.get("/session/{session_id}/debug/state")
-async def debug_state(session_id: str):
-    _ensure_debug_enabled()
-    session = get_session(session_id)
-    page = session["page"]
-    try:
-        browser_state = await page.evaluate(
-            """() => {
-                const safeStorage = (s) => { try { return s.length; } catch (e) { return -1; } };
-                return {
-                    language: navigator.language,
-                    languages: Array.from(navigator.languages || []),
-                    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-                    referrer: document.referrer,
-                    url: document.URL,
-                    userAgent: navigator.userAgent,
-                    viewport: { w: window.innerWidth, h: window.innerHeight },
-                    storageCounts: {
-                        local: safeStorage(localStorage),
-                        session: safeStorage(sessionStorage),
-                    },
-                };
-            }"""
-        )
-    except Exception as exc:
-        browser_state = {"error": str(exc)}
-
-    return {
-        "browser": browser_state,
-        "session": {
-            "last_mouse": session["last_mouse"],
-            "first_navigation": session["first_navigation"],
-            "behavior": session["behavior"],
-            "locale": session["locale"],
-            "google_warmup": session["google_warmup"],
-            "google_query": session["google_query"],
-        },
-    }
-
-
-@app.get("/session/{session_id}/debug/cookies")
-async def debug_cookies(session_id: str):
-    _ensure_debug_enabled()
-    session = get_session(session_id)
-    cookies = await session["page"].context.cookies()
-    by_domain: dict[str, dict[str, Any]] = {}
-    for c in cookies:
-        domain = c.get("domain") or "?"
-        entry = by_domain.setdefault(domain, {
-            "count": 0,
-            "earliest_expiry": None,
-            "latest_expiry": None,
-            "names": [],
-        })
-        entry["count"] += 1
-        entry["names"].append(c.get("name"))
-        expiry = c.get("expires")
-        if expiry and expiry > 0:
-            if entry["earliest_expiry"] is None or expiry < entry["earliest_expiry"]:
-                entry["earliest_expiry"] = expiry
-            if entry["latest_expiry"] is None or expiry > entry["latest_expiry"]:
-                entry["latest_expiry"] = expiry
-    return {"total": len(cookies), "by_domain": by_domain}
-
-
-@app.get("/session/{session_id}/debug/storage")
-async def debug_storage(session_id: str):
-    _ensure_debug_enabled()
-    session = get_session(session_id)
-    page = session["page"]
-    try:
-        storage = await page.evaluate(
-            """() => {
-                const keys = (s) => {
-                    try {
-                        return Array.from({ length: s.length }, (_, i) => s.key(i));
-                    } catch (e) {
-                        return { error: e.message };
-                    }
-                };
-                return {
-                    origin: window.location.origin,
-                    localStorage: keys(localStorage),
-                    sessionStorage: keys(sessionStorage),
-                };
-            }"""
-        )
-    except Exception as exc:
-        storage = {"error": str(exc)}
-    return storage
-
-
-@app.get("/session/{session_id}/debug/events")
-async def debug_events(session_id: str, since: float = 0.0, limit: int = 200):
-    _ensure_debug_enabled()
-    session = get_session(session_id)
-    events = list(session["debug_events"] or [])
-    if since:
-        events = [e for e in events if e["ts"] > since]
-    if limit and len(events) > limit:
-        events = events[-limit:]
-    return {"count": len(events), "events": events}
 
 
 @app.get("/debug/{session_id}", response_class=HTMLResponse)
@@ -765,22 +592,15 @@ async def debug_index():
     """List all active sessions with links to their debug viewers."""
     rows = ""
     for sid in sessions:
-        inspect = (
-            f' — <a href="/session/{sid}/debug/state">state</a>'
-            f' | <a href="/session/{sid}/debug/cookies">cookies</a>'
-            f' | <a href="/session/{sid}/debug/storage">storage</a>'
-            f' | <a href="/session/{sid}/debug/events">events</a>'
-        ) if DEBUG_MODE else ""
-        rows += f'<li><a href="/debug/{sid}">{sid}</a>{inspect}</li>'
+        rows += f'<li><a href="/debug/{sid}">{sid}</a></li>'
     if not rows:
         rows = "<li>No active sessions</li>"
-    note = "" if DEBUG_MODE else "<p>CAMOUFOX_DEBUG is not enabled — inspector endpoints return 404.</p>"
     return f"""<!DOCTYPE html>
 <html>
 <head><title>Camoufox Debug</title>
 <style>body {{ font-family: monospace; background: #1a1a1a; color: #ccc; padding: 20px; }} a {{ color: #6cf; }}</style>
 </head>
-<body><h1>Active Sessions</h1><ul>{rows}</ul>{note}</body></html>"""
+<body><h1>Active Sessions</h1><ul>{rows}</ul></body></html>"""
 
 
 @app.delete("/session/{session_id}")
