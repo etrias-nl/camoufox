@@ -13,7 +13,9 @@ import os
 import random
 import re
 import string
+import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urlparse
@@ -22,6 +24,7 @@ from camoufox.async_api import AsyncCamoufox
 from camoufox.exceptions import InvalidIP
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
@@ -39,6 +42,13 @@ sessions: dict[str, dict[str, Any]] = {}
 PROXY_URL = os.getenv("TWO_CAPTCHA_PROXY_URL", "")
 DEBUG_MODE = os.getenv("CAMOUFOX_DEBUG", "0") == "1"
 
+# NL-residential-proxy default. Camoufox's handle_locales splits on comma
+# and uses the first entry as the primary navigator.language; the Accept-
+# Language header is generated downstream from the full list.
+DEFAULT_LOCALE = "nl-NL, nl, en"
+DEBUG_EVENT_CAP = 500
+_SENSITIVE_HEADERS = {"authorization", "proxy-authorization", "cookie", "set-cookie"}
+
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -48,6 +58,9 @@ class CreateSessionRequest(BaseModel):
     behavior: str = "cautious"  # "cautious" or "fast"
     viewport_width: int = 1200
     viewport_height: int = 1100
+    locale: str | None = None
+    google_warmup: bool = True
+    google_query: str | None = None
 
 
 class NavigateRequest(BaseModel):
@@ -113,6 +126,55 @@ async def simulate_page_arrival(page, behavior: str):
 
 
 # ---------------------------------------------------------------------------
+# Debug instrumentation
+# ---------------------------------------------------------------------------
+
+def _safe_headers(headers: dict[str, str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for k, v in headers.items():
+        if k.lower() in _SENSITIVE_HEADERS:
+            out[k] = f"<redacted, {len(v)} chars>"
+        else:
+            out[k] = v[:512]
+    return out
+
+
+def _attach_debug_listeners(page, events: deque) -> None:
+    def on_request(request):
+        try:
+            events.append({
+                "ts": time.time(),
+                "type": "request",
+                "method": request.method,
+                "url": request.url,
+                "resource_type": request.resource_type,
+                "headers": _safe_headers(request.headers),
+            })
+        except Exception as exc:  # never let listener errors kill the page
+            logger.debug(f"debug request listener failed: {exc}")
+
+    def on_response(response):
+        try:
+            events.append({
+                "ts": time.time(),
+                "type": "response",
+                "status": response.status,
+                "url": response.url,
+                "headers": _safe_headers(response.headers),
+            })
+        except Exception as exc:
+            logger.debug(f"debug response listener failed: {exc}")
+
+    page.on("request", on_request)
+    page.on("response", on_response)
+
+
+def _ensure_debug_enabled() -> None:
+    if not DEBUG_MODE:
+        raise HTTPException(status_code=404, detail="Debug mode not enabled")
+
+
+# ---------------------------------------------------------------------------
 # App lifecycle
 # ---------------------------------------------------------------------------
 
@@ -164,13 +226,19 @@ async def create_session(req: CreateSessionRequest):
             proxy_config["password"] = parsed.password
         logger.info(f"Session {session_id} proxy: server={proxy_config['server']}, username={proxy_config.get('username', 'N/A')}, scheme={parsed.scheme}")
 
+    locale = req.locale or DEFAULT_LOCALE
     camoufox_kwargs: dict[str, Any] = {
         "headless": not DEBUG_MODE,
         "humanize": True,
+        "locale": locale,
     }
     if proxy_config:
         camoufox_kwargs["proxy"] = proxy_config
         camoufox_kwargs["geoip"] = True
+        # WebRTC can leak the real client IP past the HTTP proxy; disable it
+        # whenever we're proxying so navigator-reported IP and RTC-reported
+        # IP can't diverge.
+        camoufox_kwargs["block_webrtc"] = True
 
     try:
         browser_cm = AsyncCamoufox(**camoufox_kwargs)
@@ -185,14 +253,32 @@ async def create_session(req: CreateSessionRequest):
         {"width": req.viewport_width, "height": req.viewport_height}
     )
 
-    sessions[session_id] = {
+    session = {
         "browser": browser_cm,
         "page": page,
         "behavior": req.behavior,
         "first_navigation": True,
+        "locale": locale,
+        "google_warmup": req.google_warmup,
+        "google_query": req.google_query,
+        # Initial cursor position — used by Phase 2 (cursor continuity).
+        # Keeping it populated now so the debug snapshot is consistent.
+        "last_mouse": (
+            random.randint(100, max(101, req.viewport_width - 100)),
+            random.randint(50, max(51, req.viewport_height // 3)),
+        ),
+        "debug_events": deque(maxlen=DEBUG_EVENT_CAP) if DEBUG_MODE else None,
     }
 
-    logger.info(f"Session {session_id} created (behavior={req.behavior})")
+    if DEBUG_MODE:
+        _attach_debug_listeners(page, session["debug_events"])
+
+    sessions[session_id] = session
+
+    logger.info(
+        f"Session {session_id} created (behavior={req.behavior}, locale={locale}, "
+        f"google_warmup={req.google_warmup})"
+    )
     return {"session_id": session_id}
 
 
@@ -208,15 +294,25 @@ async def navigate(session_id: str, req: NavigateRequest):
     page = session["page"]
     behavior = session["behavior"]
 
-    goto_kwargs: dict[str, Any] = {"wait_until": "domcontentloaded", "timeout": 60000}
+    goto_kwargs: dict[str, Any] = {"wait_until": "load", "timeout": 60000}
     if session["first_navigation"]:
         # Fresh session has no referrer chain; arrive as if from a Google
         # search so the target doesn't see a direct-load / no-referrer hit.
+        # Phase 4 replaces this with a real google.nl warmup.
         goto_kwargs["referer"] = "https://www.google.com/"
         session["first_navigation"] = False
 
     logger.info(f"Session {session_id}: navigating to {req.url}")
-    await page.goto(req.url, **goto_kwargs)
+    try:
+        await page.goto(req.url, **goto_kwargs)
+    except PlaywrightTimeoutError as exc:
+        # Many anti-bot pages never fire `load` because of long-polling
+        # beacons — proceed with whatever DOM state we got. The navigation
+        # itself has already been kicked off at this point.
+        logger.warning(
+            f"Session {session_id}: goto {req.url} did not reach load within "
+            f"{goto_kwargs['timeout']}ms, continuing ({exc})"
+        )
 
     if req.page_arrival:
         await simulate_page_arrival(page, behavior)
@@ -338,6 +434,110 @@ async def screenshot(session_id: str):
     return {"base64": base64.b64encode(screenshot_bytes).decode()}
 
 
+@app.get("/session/{session_id}/debug/state")
+async def debug_state(session_id: str):
+    _ensure_debug_enabled()
+    session = get_session(session_id)
+    page = session["page"]
+    try:
+        browser_state = await page.evaluate(
+            """() => {
+                const safeStorage = (s) => { try { return s.length; } catch (e) { return -1; } };
+                return {
+                    language: navigator.language,
+                    languages: Array.from(navigator.languages || []),
+                    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                    referrer: document.referrer,
+                    url: document.URL,
+                    userAgent: navigator.userAgent,
+                    viewport: { w: window.innerWidth, h: window.innerHeight },
+                    storageCounts: {
+                        local: safeStorage(localStorage),
+                        session: safeStorage(sessionStorage),
+                    },
+                };
+            }"""
+        )
+    except Exception as exc:
+        browser_state = {"error": str(exc)}
+
+    return {
+        "browser": browser_state,
+        "session": {
+            "last_mouse": session["last_mouse"],
+            "first_navigation": session["first_navigation"],
+            "behavior": session["behavior"],
+            "locale": session["locale"],
+            "google_warmup": session["google_warmup"],
+            "google_query": session["google_query"],
+        },
+    }
+
+
+@app.get("/session/{session_id}/debug/cookies")
+async def debug_cookies(session_id: str):
+    _ensure_debug_enabled()
+    session = get_session(session_id)
+    cookies = await session["page"].context.cookies()
+    by_domain: dict[str, dict[str, Any]] = {}
+    for c in cookies:
+        domain = c.get("domain") or "?"
+        entry = by_domain.setdefault(domain, {
+            "count": 0,
+            "earliest_expiry": None,
+            "latest_expiry": None,
+            "names": [],
+        })
+        entry["count"] += 1
+        entry["names"].append(c.get("name"))
+        expiry = c.get("expires")
+        if expiry and expiry > 0:
+            if entry["earliest_expiry"] is None or expiry < entry["earliest_expiry"]:
+                entry["earliest_expiry"] = expiry
+            if entry["latest_expiry"] is None or expiry > entry["latest_expiry"]:
+                entry["latest_expiry"] = expiry
+    return {"total": len(cookies), "by_domain": by_domain}
+
+
+@app.get("/session/{session_id}/debug/storage")
+async def debug_storage(session_id: str):
+    _ensure_debug_enabled()
+    session = get_session(session_id)
+    page = session["page"]
+    try:
+        storage = await page.evaluate(
+            """() => {
+                const keys = (s) => {
+                    try {
+                        return Array.from({ length: s.length }, (_, i) => s.key(i));
+                    } catch (e) {
+                        return { error: e.message };
+                    }
+                };
+                return {
+                    origin: window.location.origin,
+                    localStorage: keys(localStorage),
+                    sessionStorage: keys(sessionStorage),
+                };
+            }"""
+        )
+    except Exception as exc:
+        storage = {"error": str(exc)}
+    return storage
+
+
+@app.get("/session/{session_id}/debug/events")
+async def debug_events(session_id: str, since: float = 0.0, limit: int = 200):
+    _ensure_debug_enabled()
+    session = get_session(session_id)
+    events = list(session["debug_events"] or [])
+    if since:
+        events = [e for e in events if e["ts"] > since]
+    if limit and len(events) > limit:
+        events = events[-limit:]
+    return {"count": len(events), "events": events}
+
+
 @app.get("/debug/{session_id}", response_class=HTMLResponse)
 async def debug_viewer(session_id: str):
     """Live debug viewer — auto-refreshing screenshot stream for a session."""
@@ -387,15 +587,22 @@ async def debug_index():
     """List all active sessions with links to their debug viewers."""
     rows = ""
     for sid in sessions:
-        rows += f'<li><a href="/debug/{sid}">{sid}</a></li>'
+        inspect = (
+            f' — <a href="/session/{sid}/debug/state">state</a>'
+            f' | <a href="/session/{sid}/debug/cookies">cookies</a>'
+            f' | <a href="/session/{sid}/debug/storage">storage</a>'
+            f' | <a href="/session/{sid}/debug/events">events</a>'
+        ) if DEBUG_MODE else ""
+        rows += f'<li><a href="/debug/{sid}">{sid}</a>{inspect}</li>'
     if not rows:
         rows = "<li>No active sessions</li>"
+    note = "" if DEBUG_MODE else "<p>CAMOUFOX_DEBUG is not enabled — inspector endpoints return 404.</p>"
     return f"""<!DOCTYPE html>
 <html>
 <head><title>Camoufox Debug</title>
 <style>body {{ font-family: monospace; background: #1a1a1a; color: #ccc; padding: 20px; }} a {{ color: #6cf; }}</style>
 </head>
-<body><h1>Active Sessions</h1><ul>{rows}</ul></body></html>"""
+<body><h1>Active Sessions</h1><ul>{rows}</ul>{note}</body></html>"""
 
 
 @app.delete("/session/{session_id}")
