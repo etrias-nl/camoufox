@@ -411,12 +411,21 @@ async def navigate(session_id: str, req: NavigateRequest):
             # referrer so the target doesn't see a bare direct load.
             goto_kwargs["referer"] = "https://www.google.com/"
         session["first_navigation"] = False
-        logger.info(
-            f"Session {session_id}: first_navigation warmup_ok={warmup_ok} "
-            f"referer={goto_kwargs.get('referer') or f'<in-session: {page.url!r}>'}"
-        )
 
-    logger.info(f"Session {session_id}: navigating to {req.url}")
+    # Playwright's page.goto does NOT auto-inherit the current page's URL
+    # as Referer — it's address-bar-equivalent. Set it explicitly so the
+    # in-session Referer chain matches what was on screen: after a
+    # successful warmup this is the google.nl SERP URL, and on subsequent
+    # navigations it's whatever the previous page was.
+    if "referer" not in goto_kwargs:
+        current = page.url or ""
+        if current and not current.startswith("about:"):
+            goto_kwargs["referer"] = current
+
+    logger.info(
+        f"Session {session_id}: navigating to {req.url} "
+        f"(referer={goto_kwargs.get('referer')!r})"
+    )
     try:
         await page.goto(req.url, **goto_kwargs)
     except PlaywrightTimeoutError as exc:
