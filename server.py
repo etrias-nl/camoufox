@@ -171,6 +171,21 @@ async def simulate_page_arrival(session: dict[str, Any]):
         await human_delay(0.8, 0.4)
 
 
+async def _wait_for_load_best_effort(page, session_id: str, action: str) -> None:
+    """Wait for the page to reach the `load` state before interacting with
+    the DOM, so anti-bot bootstraps that mutate the target element have
+    had a chance to finish. If the page never reaches `load` (long-poll
+    beacons, challenge iframes), log and proceed — the caller explicitly
+    asked us to act on this element."""
+    try:
+        await page.wait_for_load_state("load", timeout=30000)
+    except PlaywrightTimeoutError as exc:
+        logger.warning(
+            f"Session {session_id}: {action} waited on load but didn't reach "
+            f"it within 30s, proceeding anyway ({exc})"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Debug instrumentation
 # ---------------------------------------------------------------------------
@@ -406,6 +421,7 @@ async def wait_for(session_id: str, req: WaitRequest):
 async def click(session_id: str, req: ClickRequest):
     session = get_session(session_id)
     page = session["page"]
+    await _wait_for_load_best_effort(page, session_id, "click")
     locator = page.locator(req.selector)
     await locator.scroll_into_view_if_needed()
     await locator.click()
@@ -418,6 +434,7 @@ async def type_text(session_id: str, req: TypeRequest):
     session = get_session(session_id)
     page = session["page"]
     behavior = session["behavior"]
+    await _wait_for_load_best_effort(page, session_id, "type")
     locator = page.locator(req.selector)
     await locator.scroll_into_view_if_needed()
     await locator.click()
