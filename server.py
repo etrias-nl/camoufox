@@ -135,24 +135,6 @@ def _hostname_sld(url: str) -> str:
     return labels[0]
 
 
-async def _human_click(locator, **click_kwargs) -> None:
-    """Click the locator at a point drawn from a gaussian around its
-    center (stddev = size/6), clamped to a 4px safe margin so we never
-    miss the element. A real user's click-centroid wanders a bit inside
-    the button; dead-center-every-time is a cheap bot signal."""
-    try:
-        box = await locator.bounding_box()
-    except Exception:
-        box = None
-    if box and box["width"] > 8 and box["height"] > 8:
-        w, h = box["width"], box["height"]
-        ox = max(4.0, min(w - 4.0, random.gauss(w / 2, w / 6)))
-        oy = max(4.0, min(h - 4.0, random.gauss(h / 2, h / 6)))
-        await locator.click(position={"x": ox, "y": oy}, **click_kwargs)
-    else:
-        await locator.click(**click_kwargs)
-
-
 async def _human_scroll_by(page, delta_y: int) -> None:
     """Scroll the page by delta_y pixels using real mouse wheel events in
     several small chunks with small random delays. Fires wheel/scroll
@@ -273,14 +255,14 @@ async def google_search_warmup(
         try:
             consent = page.locator("#L2AGLb")
             await consent.wait_for(state="visible", timeout=3000)
-            await _human_click(consent)
+            await consent.click()
             logger.info(f"Session {session_id}: warmup:consent_clicked")
         except Exception:
             pass
 
         search_box = page.locator('textarea[name="q"], input[name="q"]').first
         await search_box.wait_for(state="visible", timeout=8000)
-        await _human_click(search_box)
+        await search_box.click()
         await search_box.fill(query)
         await page.keyboard.press("Enter")
         logger.info(f"Session {session_id}: warmup:query_submitted")
@@ -569,7 +551,7 @@ async def click(session_id: str, req: ClickRequest):
     await _wait_for_load_best_effort(page, session_id, "click")
     locator = page.locator(req.selector)
     await _human_scroll_to_locator(page, locator)
-    await _human_click(locator)
+    await locator.click()
     return {"clicked": True}
 
 
@@ -581,7 +563,7 @@ async def type_text(session_id: str, req: TypeRequest):
     await _wait_for_load_best_effort(page, session_id, "type")
     locator = page.locator(req.selector)
     await _human_scroll_to_locator(page, locator)
-    await _human_click(locator)
+    await locator.click()
 
     # Simulate hands moving from mouse back to keyboard
     await asyncio.sleep(random.uniform(0.4, 0.9))
