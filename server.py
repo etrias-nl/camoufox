@@ -183,7 +183,7 @@ async def google_search_warmup(
     try:
         try:
             await page.goto(
-                "https://www.google.nl/",
+                "https://www.google.com/",
                 wait_until="load",
                 timeout=30000,
             )
