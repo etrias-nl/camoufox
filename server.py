@@ -102,10 +102,40 @@ async def human_delay(mean: float = 2.0, std: float = 1.0):
     await asyncio.sleep(delay)
 
 
-async def simulate_page_arrival(page, behavior: str):
+def _clamp(value: float, low: float, high: float) -> int:
+    return int(max(low, min(high, value)))
+
+
+async def _move_and_track(page, session: dict[str, Any], x: int, y: int) -> None:
+    await page.mouse.move(x, y)
+    session["last_mouse"] = (x, y)
+
+
+async def _update_last_mouse_from_locator(session: dict[str, Any], locator) -> None:
+    """Set session last_mouse to the on-screen center of a locator. No-op if
+    the element is gone (navigated away, detached) or offscreen."""
+    try:
+        box = await locator.bounding_box()
+    except Exception:
+        return
+    if not box:
+        return
+    session["last_mouse"] = (
+        int(box["x"] + box["width"] / 2),
+        int(box["y"] + box["height"] / 2),
+    )
+
+
+async def simulate_page_arrival(session: dict[str, Any]):
     """Simulate a user settling onto a freshly loaded page: small glance
-    with the mouse and a short scroll. Camoufox's humanize=True already
-    curves the mouse path between points."""
+    with the mouse and a short scroll. Continues from the last known
+    cursor position so the pointer doesn't teleport across navigations —
+    a real OS cursor stays where the user left it.
+
+    Camoufox's humanize=True curves the mouse path between points; we
+    pick the points."""
+    page = session["page"]
+    behavior = session["behavior"]
     if behavior == "fast":
         await asyncio.sleep(random.uniform(0.3, 0.8))
         return
@@ -113,10 +143,26 @@ async def simulate_page_arrival(page, behavior: str):
     await human_delay(1.0, 0.5)
 
     viewport = page.viewport_size or {"width": 1200, "height": 1100}
-    max_x = max(101, viewport["width"] - 100)
-    max_y = max(101, viewport["height"] - 100)
+    margin = 20
+    max_x = viewport["width"] - margin
+    max_y = viewport["height"] - margin
+    sx, sy = session["last_mouse"]
+
+    # First move: short drift from wherever the cursor already is, so the
+    # new-page settle looks continuous with whatever the user was doing
+    # before. ~150px gaussian, clamped inside the viewport.
+    nearby_x = _clamp(sx + random.gauss(0, 150), margin, max_x)
+    nearby_y = _clamp(sy + random.gauss(0, 150), margin, max_y)
+    await _move_and_track(page, session, nearby_x, nearby_y)
+    await asyncio.sleep(random.uniform(0.2, 0.7))
+
+    # Then 1-3 more "glance around" moves. These can be broader but we
+    # still anchor them to the current cursor rather than a fresh random.
     for _ in range(random.randint(1, 3)):
-        await page.mouse.move(random.randint(100, max_x), random.randint(100, max_y))
+        cx, cy = session["last_mouse"]
+        gx = _clamp(cx + random.gauss(0, 220), margin, max_x)
+        gy = _clamp(cy + random.gauss(0, 220), margin, max_y)
+        await _move_and_track(page, session, gx, gy)
         await asyncio.sleep(random.uniform(0.2, 0.7))
 
     # 70% chance: scroll a bit to look natural
@@ -292,7 +338,6 @@ def get_session(session_id: str) -> dict[str, Any]:
 async def navigate(session_id: str, req: NavigateRequest):
     session = get_session(session_id)
     page = session["page"]
-    behavior = session["behavior"]
 
     goto_kwargs: dict[str, Any] = {"wait_until": "load", "timeout": 60000}
     if session["first_navigation"]:
@@ -315,7 +360,7 @@ async def navigate(session_id: str, req: NavigateRequest):
         )
 
     if req.page_arrival:
-        await simulate_page_arrival(page, behavior)
+        await simulate_page_arrival(session)
 
     html = await page.content()
     return {"html": html, "url": page.url}
@@ -364,6 +409,7 @@ async def click(session_id: str, req: ClickRequest):
     locator = page.locator(req.selector)
     await locator.scroll_into_view_if_needed()
     await locator.click()
+    await _update_last_mouse_from_locator(session, locator)
     return {"clicked": True}
 
 
@@ -375,6 +421,7 @@ async def type_text(session_id: str, req: TypeRequest):
     locator = page.locator(req.selector)
     await locator.scroll_into_view_if_needed()
     await locator.click()
+    await _update_last_mouse_from_locator(session, locator)
 
     # Simulate hands moving from mouse back to keyboard
     await asyncio.sleep(random.uniform(0.4, 0.9))
@@ -410,7 +457,7 @@ async def scroll(session_id: str):
 @app.post("/session/{session_id}/page_arrived")
 async def page_arrived(session_id: str):
     session = get_session(session_id)
-    await simulate_page_arrival(session["page"], session["behavior"])
+    await simulate_page_arrival(session)
     return {"arrived": True}
 
 
