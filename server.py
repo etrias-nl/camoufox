@@ -267,21 +267,33 @@ async def google_search_warmup(
         search_box = page.locator('textarea[name="q"], input[name="q"]').first
         await search_box.wait_for(state="visible", timeout=8000)
 
-        step = "search_box_fill"
+        step = "search_box_type"
+        # Use keyboard.type rather than fill: fill just sets
+        # element.value via JS, skipping keydown/keypress events.
+        # Google's form handler reads those events to track query
+        # state — without them, Enter becomes a no-op and we stay
+        # on the home page.
         await search_box.click()
-        await search_box.fill(query)
+        await page.keyboard.type(query, delay=0)
 
         step = "submit_enter"
         await page.keyboard.press("Enter")
         logger.info(f"Session {session_id}: warmup:query_submitted")
 
-        step = "serp_load"
+        step = "serp_nav"
+        # wait_for_url actually proves the SERP loaded; wait_for_load_state
+        # would return immediately if we never navigated off the homepage.
         try:
-            await page.wait_for_load_state("load", timeout=30000)
+            await page.wait_for_url(
+                lambda u: "/search" in u, timeout=30000
+            )
         except PlaywrightTimeoutError as exc:
             logger.warning(
-                f"Session {session_id}: warmup:serp_load_timeout ({exc})"
+                f"Session {session_id}: warmup:no_serp_nav "
+                f"url={page.url!r} ({exc})"
             )
+            return False
+
         logger.info(
             f"Session {session_id}: warmup:serp_loaded url={page.url!r}"
         )
