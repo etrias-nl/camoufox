@@ -22,6 +22,7 @@ from camoufox.async_api import AsyncCamoufox
 from camoufox.exceptions import InvalidIP
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel
 
@@ -520,13 +521,48 @@ async def navigate(session_id: str, req: NavigateRequest):
             f"Session {session_id}: goto {req.url} did not reach load within "
             f"{goto_kwargs['timeout']}ms, continuing ({exc})"
         )
+    except PlaywrightError as exc:
+        # NS_ERROR_NET_INTERRUPT / NS_ERROR_ABORT: the page started
+        # loading, then a second same-frame navigation (JS
+        # location.replace, meta-refresh) interrupted ours before load
+        # fired. The browser is on the right page, just not the URL we
+        # asked for. DNS / connection errors are different classes and
+        # should NOT be swallowed — re-raise anything else.
+        msg = str(exc)
+        if "NS_ERROR_NET_INTERRUPT" in msg or "NS_ERROR_ABORT" in msg:
+            logger.warning(
+                f"Session {session_id}: goto {req.url} interrupted by "
+                f"sub-navigation — waiting for settle ({exc})"
+            )
+            try:
+                await page.wait_for_load_state("load", timeout=30000)
+            except PlaywrightTimeoutError:
+                pass
+            logger.info(
+                f"Session {session_id}: settled at {page.url!r}"
+            )
+        else:
+            raise
 
     if req.page_arrival:
         await simulate_page_arrival(page, session["behavior"])
 
     await _log_state_snapshot(page, session_id, "post_navigate")
 
-    html = await page.content()
+    try:
+        html = await page.content()
+    except PlaywrightError as exc:
+        # Page still in flux (redirect chain not done) — give it one
+        # more chance to settle, then try again. If it still fails,
+        # surface the error.
+        logger.warning(
+            f"Session {session_id}: content() failed, retrying after settle ({exc})"
+        )
+        try:
+            await page.wait_for_load_state("load", timeout=15000)
+        except PlaywrightTimeoutError:
+            pass
+        html = await page.content()
     return {"html": html, "url": page.url}
 
 
