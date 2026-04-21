@@ -216,8 +216,8 @@ async def google_search_warmup(
     target_url: str,
     session_id: str,
 ) -> bool:
-    """Build a real search history on google.nl before the first target
-    navigation. Goto google.nl, (optionally) clear the consent
+    """Build a real search history on google.com before the first target
+    navigation. Goto google.com, (optionally) clear the consent
     interstitial, type a derived query, submit, and leave the browser
     on the SERP — the subsequent page.goto(target_url) then sets Referer
     from the SERP URL naturally, and the session has real Google cookies
@@ -232,6 +232,7 @@ async def google_search_warmup(
     query = session["google_query"] or f"{_hostname_sld(target_url)} portal"
     logger.info(f"Session {session_id}: warmup:start query={query!r}")
 
+    step = "goto_google"
     try:
         try:
             await page.goto(
@@ -250,23 +251,31 @@ async def google_search_warmup(
         # cover. Skip the humanize ritual here to shave seconds off every
         # session startup.
 
-        # Consent interstitial (Dutch "Alles accepteren"). Short wait —
-        # NL residential IPs usually skip it entirely.
+        step = "consent"
+        # Consent interstitial ("Alles accepteren" / "Accept all"). Short
+        # wait — residential IPs with prior google.com cookies usually
+        # skip it entirely.
         try:
             consent = page.locator("#L2AGLb")
             await consent.wait_for(state="visible", timeout=3000)
             await consent.click()
             logger.info(f"Session {session_id}: warmup:consent_clicked")
         except Exception:
-            pass
+            logger.info(f"Session {session_id}: warmup:consent_skipped (not shown)")
 
+        step = "search_box_wait"
         search_box = page.locator('textarea[name="q"], input[name="q"]').first
         await search_box.wait_for(state="visible", timeout=8000)
+
+        step = "search_box_fill"
         await search_box.click()
         await search_box.fill(query)
+
+        step = "submit_enter"
         await page.keyboard.press("Enter")
         logger.info(f"Session {session_id}: warmup:query_submitted")
 
+        step = "serp_load"
         try:
             await page.wait_for_load_state("load", timeout=30000)
         except PlaywrightTimeoutError as exc:
@@ -280,7 +289,8 @@ async def google_search_warmup(
         return True
     except Exception as exc:
         logger.warning(
-            f"Session {session_id}: warmup:fallthrough reason={exc!r}"
+            f"Session {session_id}: warmup:fallthrough step={step} "
+            f"url={page.url!r} reason={exc!r}"
         )
         return False
 
@@ -477,8 +487,8 @@ async def navigate(session_id: str, req: NavigateRequest):
     # Playwright's page.goto does NOT auto-inherit the current page's URL
     # as Referer — it's address-bar-equivalent. Set it explicitly so the
     # in-session Referer chain matches what was on screen: after a
-    # successful warmup this is the google.nl SERP URL, and on subsequent
-    # navigations it's whatever the previous page was.
+    # successful warmup this is the google.com SERP URL, and on
+    # subsequent navigations it's whatever the previous page was.
     if "referer" not in goto_kwargs:
         current = page.url or ""
         if current and not current.startswith("about:"):
