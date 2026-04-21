@@ -19,7 +19,6 @@ from typing import Any
 from urllib.parse import urlparse
 
 from camoufox.async_api import AsyncCamoufox
-from camoufox.exceptions import InvalidIP
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from playwright.async_api import Error as PlaywrightError
@@ -397,48 +396,100 @@ async def health():
     return {"status": "ok", "active_sessions": len(sessions)}
 
 
+def _build_proxy_config(raw_proxy_url: str) -> tuple[dict, str]:
+    """Randomize the proxy session token and return (playwright_config,
+    redacted_server_str_for_logging)."""
+    random_session = ''.join(random.choices(string.ascii_letters + string.digits, k=9))
+    rotated = re.sub(
+        r'(session-)[A-Za-z0-9]+([-:])', rf'\g<1>{random_session}\2', raw_proxy_url
+    )
+    parsed = urlparse(rotated)
+    config: dict[str, Any] = {
+        "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+    }
+    if parsed.username:
+        config["username"] = parsed.username
+    if parsed.password:
+        config["password"] = parsed.password
+    return config, f"{config['server']} (session=...{random_session[-4:]})"
+
+
+MAX_PROXY_ATTEMPTS = 3
+
+
 @app.post("/session")
 async def create_session(req: CreateSessionRequest):
     session_id = str(uuid.uuid4())
 
-    proxy_url = req.proxy_url or PROXY_URL or None
-    proxy_config = None
-    if proxy_url:
-        # Randomize the session ID in the proxy username for a fresh residential IP
-        random_session = ''.join(random.choices(string.ascii_letters + string.digits, k=9))
-        proxy_url = re.sub(r'(session-)[A-Za-z0-9]+([-:])', rf'\g<1>{random_session}\2', proxy_url)
-        parsed = urlparse(proxy_url)
-        proxy_config = {
-            "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
-        }
-        if parsed.username:
-            proxy_config["username"] = parsed.username
-        if parsed.password:
-            proxy_config["password"] = parsed.password
-        logger.info(f"Session {session_id} proxy: server={proxy_config['server']}, username={proxy_config.get('username', 'N/A')}, scheme={parsed.scheme}")
+    raw_proxy_url = req.proxy_url or PROXY_URL or None
 
     locale = req.locale or DEFAULT_LOCALE
-    camoufox_kwargs: dict[str, Any] = {
+    base_kwargs: dict[str, Any] = {
         "headless": not DEBUG_MODE,
         "humanize": True,
         "locale": locale,
     }
-    if proxy_config:
-        camoufox_kwargs["proxy"] = proxy_config
-        camoufox_kwargs["geoip"] = True
-        # WebRTC can leak the real client IP past the HTTP proxy; disable it
-        # whenever we're proxying so navigator-reported IP and RTC-reported
-        # IP can't diverge.
-        camoufox_kwargs["block_webrtc"] = True
 
-    try:
-        browser_cm = AsyncCamoufox(**camoufox_kwargs)
+    browser_cm = None
+    browser = None
+
+    if raw_proxy_url:
+        # Retry proxy-backed session creation up to N times with fresh
+        # session tokens. We never fall back to a direct connection —
+        # the server's own egress IP (datacenter) is blocked on sight
+        # by every portal anti-bot. If all attempts fail, surface 503
+        # so the caller can retry / route around.
+        last_exc: Exception | None = None
+        for attempt in range(1, MAX_PROXY_ATTEMPTS + 1):
+            proxy_config, redacted = _build_proxy_config(raw_proxy_url)
+            attempt_kwargs = {
+                **base_kwargs,
+                "proxy": proxy_config,
+                "geoip": True,
+                # WebRTC can leak the real client IP past the HTTP proxy;
+                # block so navigator-reported IP and RTC-reported IP can't
+                # diverge.
+                "block_webrtc": True,
+            }
+            logger.info(
+                f"Session {session_id}: proxy attempt "
+                f"{attempt}/{MAX_PROXY_ATTEMPTS} via {redacted}"
+            )
+            try:
+                browser_cm = AsyncCamoufox(**attempt_kwargs)
+                browser = await browser_cm.__aenter__()
+                break
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    f"Session {session_id}: proxy attempt {attempt}/"
+                    f"{MAX_PROXY_ATTEMPTS} failed "
+                    f"({type(exc).__name__}: {exc})"
+                )
+                if browser_cm is not None:
+                    try:
+                        await browser_cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                browser_cm = None
+                browser = None
+
+        if browser is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Failed to acquire residential proxy after "
+                    f"{MAX_PROXY_ATTEMPTS} attempts: "
+                    f"{type(last_exc).__name__}: {last_exc}"
+                ),
+            )
+    else:
+        # No proxy configured — caller explicitly wants a direct
+        # connection. This is only safe for local dev / testing.
+        logger.info(f"Session {session_id}: no proxy configured, direct connection")
+        browser_cm = AsyncCamoufox(**base_kwargs)
         browser = await browser_cm.__aenter__()
-    except InvalidIP:
-        logger.warning(f"Session {session_id} geoip lookup failed, retrying without geoip")
-        camoufox_kwargs["geoip"] = False
-        browser_cm = AsyncCamoufox(**camoufox_kwargs)
-        browser = await browser_cm.__aenter__()
+
     page = await browser.new_page()
     await page.set_viewport_size(
         {"width": req.viewport_width, "height": req.viewport_height}
