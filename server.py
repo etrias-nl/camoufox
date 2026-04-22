@@ -13,6 +13,7 @@ import os
 import random
 import re
 import string
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
@@ -385,6 +386,36 @@ async def lifespan(application: FastAPI):
 
 
 app = FastAPI(title="Camoufox Stealth Browser Sidecar", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Optional per-op trace logging (gated by CAMOUFOX_DEBUG)
+# ---------------------------------------------------------------------------
+_SESSION_OP_RE = re.compile(r"^/session/([^/]+)/(.+)$")
+
+
+@app.middleware("http")
+async def log_session_ops(request, call_next):
+    if not DEBUG_MODE:
+        return await call_next(request)
+    match = _SESSION_OP_RE.match(request.url.path)
+    if not match:
+        return await call_next(request)
+    session_id, op = match.group(1), match.group(2)
+    start = time.monotonic()
+    logger.info(f"Session {session_id}: {op}:start")
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        logger.exception(f"Session {session_id}: {op}:fail ({elapsed_ms}ms)")
+        raise
+    elapsed_ms = int((time.monotonic() - start) * 1000)
+    if response.status_code < 400:
+        logger.info(f"Session {session_id}: {op}:ok status={response.status_code} ({elapsed_ms}ms)")
+    else:
+        logger.warning(f"Session {session_id}: {op}:fail status={response.status_code} ({elapsed_ms}ms)")
+    return response
 
 
 # ---------------------------------------------------------------------------
